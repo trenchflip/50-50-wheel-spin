@@ -138,6 +138,23 @@ try {
   burnFeed = [];
 }
 
+if (!DEMO_MODE) {
+  burnFeed = burnFeed.filter(
+    (entry) => !entry?.dryRun && !String(entry?.signature ?? "").startsWith("demo-")
+  );
+  if (roundsState?.current?.entries) {
+    roundsState.current.entries = roundsState.current.entries.filter((e) => !e?.demo);
+  }
+  if (Array.isArray(roundsState?.history)) {
+    roundsState.history = roundsState.history.filter((round) => {
+      if (Array.isArray(round?.entries) && round.entries.some((e) => e?.demo)) return false;
+      return true;
+    });
+  }
+  saveRounds(roundsState);
+  fs.writeFileSync(BURNS_PATH, JSON.stringify(burnFeed.slice(0, 50), null, 2));
+}
+
 function persistBurns() {
   fs.writeFileSync(BURNS_PATH, JSON.stringify(burnFeed.slice(0, 50), null, 2));
 }
