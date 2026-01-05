@@ -43,7 +43,7 @@ export default function RoundHistory() {
   return (
     <div className="card">
       <h3>Recent Spins</h3>
-      <div className="round-history">
+      <div className="round-history winners-history">
         {rounds.length === 0 ? (
           <div className="round-item">No spins yet.</div>
         ) : (

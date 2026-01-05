@@ -10,6 +10,7 @@ type Config = {
   housePubkey: string;
   minPlayers: number;
   roundIntervalMs: number;
+  burnBotLive?: boolean;
 };
 
 type Entry = {
@@ -292,6 +293,10 @@ export default function WheelCard() {
       setMessage("Loading config...");
       return;
     }
+    if (!config.burnBotLive) {
+      setMessage("Entries are paused until burn bot is live.");
+      return;
+    }
     if (betSol <= 0) {
       setMessage("Enter a valid amount.");
       return;
@@ -364,6 +369,12 @@ export default function WheelCard() {
           <b>{countdown}</b>
         </div>
       </div>
+
+      {!config?.burnBotLive && (
+        <div className="pause-banner">
+          Entries are paused until the burn bot is live.
+        </div>
+      )}
 
       <details className="how-it-works">
         <summary>How it works</summary>
@@ -446,8 +457,8 @@ export default function WheelCard() {
           onChange={(e) => setBet(e.target.value)}
           placeholder="Entry amount (SOL)"
         />
-        <button onClick={enterWheel} disabled={submitting}>
-          {submitting ? "Submitting..." : "Enter"}
+        <button onClick={enterWheel} disabled={submitting || !config?.burnBotLive}>
+          {config?.burnBotLive ? (submitting ? "Submitting..." : "Enter") : "Entries Paused"}
         </button>
       </div>
 
