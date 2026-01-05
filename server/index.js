@@ -11,8 +11,16 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
+  VersionedTransaction,
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
+import {
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  getAssociatedTokenAddress,
+  createAssociatedTokenAccountInstruction,
+  getMint,
+} from "@solana/spl-token";
 
 const app = express();
 app.use(cors());
@@ -42,8 +50,13 @@ const BUYBACK_SLIPPAGE_BPS = Number(process.env.BUYBACK_SLIPPAGE_BPS || 20000);
 const MAX_BUYBACK_LAMPORTS = process.env.MAX_BUYBACK_LAMPORTS
   ? Number(process.env.MAX_BUYBACK_LAMPORTS)
   : null;
-const PUMPFUN_API_URL = process.env.PUMPFUN_API_URL || "";
+const JUPITER_API_URL = process.env.JUPITER_API_URL || "https://quote-api.jup.ag/v6";
 const MIN_HOUSE_RESERVE_LAMPORTS = Number(process.env.MIN_HOUSE_RESERVE_LAMPORTS || 0);
+const BURN_BOT_LIVE = process.env.BURN_BOT_LIVE === "1";
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const MARKETCAP_CACHE_MS = Number(process.env.MARKETCAP_CACHE_MS || 5000);
+let lastMarketCap = null;
+let lastMarketCapAt = 0;
 
 if (!fs.existsSync(HOUSE_PATH)) {
   throw new Error(`HOUSE keypair missing. Set HOUSE_PATH or provide ${HOUSE_PATH}.`);
@@ -321,35 +334,96 @@ async function executeBuyback(buybackLamports) {
     console.warn("Buyback skipped: BURN_MINT not set.");
     return;
   }
-  if (!PUMPFUN_API_URL) {
-    console.warn("Buyback skipped: PUMPFUN_API_URL not set.");
+
+  const mintKey = new PublicKey(BURN_MINT);
+  const burnKey = new PublicKey(BURN_ADDRESS);
+  const mintInfo = await connection.getAccountInfo(mintKey);
+  if (!mintInfo) {
+    console.warn("Buyback skipped: mint not found on RPC.");
+    return;
+  }
+  const tokenProgramId =
+    mintInfo.owner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+
+  const burnAta = await getAssociatedTokenAddress(mintKey, burnKey, true, tokenProgramId);
+  const burnAtaInfo = await connection.getAccountInfo(burnAta);
+  if (!burnAtaInfo) {
+    const ataTx = new Transaction().add(
+      createAssociatedTokenAccountInstruction(
+        HOUSE.publicKey,
+        burnAta,
+        burnKey,
+        mintKey,
+        tokenProgramId
+      )
+    );
+    ataTx.feePayer = HOUSE.publicKey;
+    ataTx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
+    ataTx.sign(HOUSE);
+    await connection.sendRawTransaction(ataTx.serialize(), { skipPreflight: false });
+  }
+
+  const quoteUrl = new URL(`${JUPITER_API_URL}/quote`);
+  quoteUrl.searchParams.set("inputMint", SOL_MINT);
+  quoteUrl.searchParams.set("outputMint", BURN_MINT);
+  quoteUrl.searchParams.set("amount", String(amountLamports));
+  quoteUrl.searchParams.set("slippageBps", String(BUYBACK_SLIPPAGE_BPS));
+  quoteUrl.searchParams.set("swapMode", "ExactIn");
+
+  const quoteResp = await fetch(quoteUrl.toString());
+  if (!quoteResp.ok) {
+    const body = await quoteResp.text();
+    console.warn("Buyback quote failed:", quoteResp.status, body.slice(0, 200));
+    return;
+  }
+  const quoteJson = await quoteResp.json();
+  const quote = Array.isArray(quoteJson?.data) ? quoteJson.data[0] : quoteJson;
+  if (!quote) {
+    console.warn("Buyback quote empty.");
     return;
   }
 
-  const resp = await fetch(PUMPFUN_API_URL, {
+  const swapResp = await fetch(`${JUPITER_API_URL}/swap`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      mint: BURN_MINT,
-      amountLamports,
-      slippageBps: BUYBACK_SLIPPAGE_BPS,
-      burnAddress: BURN_ADDRESS,
-      payer: HOUSE.publicKey.toBase58(),
+      quoteResponse: quote,
+      userPublicKey: HOUSE.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      destinationTokenAccount: burnAta.toBase58(),
     }),
   });
 
-  if (!resp.ok) {
-    const body = await resp.text();
-    console.warn("Buyback failed:", resp.status, body.slice(0, 200));
+  if (!swapResp.ok) {
+    const body = await swapResp.text();
+    console.warn("Buyback swap failed:", swapResp.status, body.slice(0, 200));
     return;
   }
 
-  const data = await resp.json();
+  const swapJson = await swapResp.json();
+  const swapTx = swapJson?.swapTransaction;
+  if (!swapTx) {
+    console.warn("Buyback swap missing transaction.");
+    return;
+  }
+
+  const tx = VersionedTransaction.deserialize(Buffer.from(swapTx, "base64"));
+  tx.sign([HOUSE]);
+  const sig = await connection.sendRawTransaction(tx.serialize(), { maxRetries: 3 });
+
+  const mintData = await getMint(connection, mintKey, "confirmed", tokenProgramId);
+  const decimals = mintData.decimals ?? 0;
+  const outAmountRaw = BigInt(quote.outAmount ?? "0");
+  const burnAmountUi =
+    decimals > 0
+      ? (Number(outAmountRaw) / 10 ** decimals).toFixed(6)
+      : outAmountRaw.toString();
+
   recordBurn({
-    signature: data.signature ?? `buyback-${Date.now()}`,
+    signature: sig,
     timestamp: nowIso(),
     mint: BURN_MINT,
-    burnAmountUi: data.burnAmountUi ?? null,
+    burnAmountUi,
     buybackLamports: amountLamports,
     dryRun: false,
   });
@@ -362,6 +436,7 @@ app.get("/config", (req, res) => {
     housePubkey: HOUSE.publicKey.toBase58(),
     minPlayers: MIN_PLAYERS,
     roundIntervalMs: ROUND_INTERVAL_MS,
+    burnBotLive: BURN_BOT_LIVE,
   });
 });
 
@@ -373,13 +448,40 @@ app.get("/burns", (req, res) => {
   return res.json({ burns: burnFeed });
 });
 
-app.get("/marketcap", (req, res) => {
-  const value = process.env.MARKETCAP_USD;
-  if (value == null) {
+app.get("/marketcap", async (req, res) => {
+  if (!BURN_MINT) {
     return res.json({ marketCapUsd: null });
   }
-  const parsed = Number(value);
-  return res.json({ marketCapUsd: Number.isFinite(parsed) ? parsed : null });
+
+  const now = Date.now();
+  if (lastMarketCap != null && now - lastMarketCapAt < MARKETCAP_CACHE_MS) {
+    return res.json({ marketCapUsd: lastMarketCap });
+  }
+
+  try {
+    const supply = await connection.getTokenSupply(new PublicKey(BURN_MINT), "confirmed");
+    const uiSupply = Number(supply.value.uiAmountString ?? supply.value.uiAmount ?? 0);
+    if (!Number.isFinite(uiSupply) || uiSupply <= 0) {
+      return res.json({ marketCapUsd: null });
+    }
+
+    const priceResp = await fetch(`https://price.jup.ag/v4/price?ids=${BURN_MINT}`);
+    if (!priceResp.ok) {
+      return res.json({ marketCapUsd: null });
+    }
+    const priceJson = await priceResp.json();
+    const price = priceJson?.data?.[BURN_MINT]?.price;
+    if (!Number.isFinite(price)) {
+      return res.json({ marketCapUsd: null });
+    }
+
+    const marketCapUsd = uiSupply * price;
+    lastMarketCap = marketCapUsd;
+    lastMarketCapAt = now;
+    return res.json({ marketCapUsd });
+  } catch {
+    return res.json({ marketCapUsd: null });
+  }
 });
 
 app.get("/round/history", (req, res) => {
@@ -389,6 +491,9 @@ app.get("/round/history", (req, res) => {
 
 app.post("/enter", async (req, res) => {
   try {
+    if (!BURN_BOT_LIVE) {
+      return res.status(403).json({ error: "Entries are paused until burn bot is live." });
+    }
     const { signature, expectedLamports } = req.body || {};
     if (!signature || typeof signature !== "string") {
       return res.status(400).json({ error: "Missing signature" });
